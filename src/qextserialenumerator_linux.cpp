@@ -35,6 +35,11 @@
 #include <QtCore/QDebug>
 #include <QtCore/QStringList>
 #include <QtCore/QDir>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/serial.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 void QextSerialEnumeratorPrivate::init_sys()
 {
@@ -114,29 +119,59 @@ QList<QextPortInfo> QextSerialEnumeratorPrivate::getPorts_sys()
     udev_unref(ud);
 #else
     QStringList portNamePrefixes, portNameList;
-    portNamePrefixes << QLatin1String("ttyS*"); // list normal serial ports first
+    portNamePrefixes
+            << QLatin1String("ttyS*")
+            << QLatin1String("ttyACM*")
+            << QLatin1String("ttyUSB*")
+            << QLatin1String("rfcomm*");
 
-    QDir dir(QLatin1String("/dev"));
-    portNameList = dir.entryList(portNamePrefixes, (QDir::System | QDir::Files), QDir::Name);
+    QString sysdir("/sys/class/tty");
+    QDir dir(sysdir.toLatin1());
+    portNameList = dir.entryList(portNamePrefixes, (QDir::System | QDir::Dirs), QDir::Name);
 
-    // remove the values which are not serial ports for e.g.  /dev/ttysa
+    QStringList portValidList;
+
     for (int i = 0; i < portNameList.size(); i++) {
-        bool ok;
-        QString current = portNameList.at(i);
-        // remove the ttyS part, and check, if the other part is a number
-        current.remove(0,4).toInt(&ok, 10);
-        if (!ok) {
-            portNameList.removeAt(i);
-            i--;
+        // get device driver
+        QString devicedir = sysdir + "/" + portNameList.at(i) + "/device";
+        struct stat st;
+        if(lstat(devicedir.toStdString().c_str(), &st) == 0 && S_ISLNK(st.st_mode)){
+            char buffer[1024];
+            memset(buffer, 0, sizeof(buffer));
+            devicedir += "/driver";
+            if(readlink(devicedir.toStdString().c_str(), buffer, sizeof(buffer)) <= 0)
+            {
+                continue;
+            }
+            QString driver = basename(buffer);
+            if(driver.length() > 0)
+            {
+                if(driver == "serial8250")
+                {
+                    QString devfile = "/dev/" + portNameList.at(i);
+                    //try to open device
+                    int fd = open(devfile.toStdString().c_str(), O_RDWR | O_NONBLOCK | O_NOCTTY);
+                    if(fd >= 0)
+                    {
+                        //Get serial info
+                        struct serial_struct serinfo;
+                        if(ioctl(fd, TIOCGSERIAL, &serinfo) == 0){
+                            //if device type is PORT_UNKNOWN
+                            if (serinfo.type == PORT_UNKNOWN)
+                            {
+                                continue;
+                            }
+                        }
+                        close(fd);
+                    }else{
+                        continue;
+                    }
+                }
+                portValidList.append(portNameList.at(i));
+            }
         }
     }
-
-    // get the non standard serial ports names
-    // (USB-serial, bluetooth-serial, 18F PICs, and so on)
-    // if you know an other name prefix for serial ports please let us know
-    portNamePrefixes.clear();
-    portNamePrefixes << QLatin1String("ttyACM*") << QLatin1String("ttyUSB*") << QLatin1String("rfcomm*");
-    portNameList += dir.entryList(portNamePrefixes, (QDir::System | QDir::Files), QDir::Name);
+   portNameList = portValidList;
 
     foreach (QString str , portNameList) {
         QextPortInfo inf;
