@@ -44,6 +44,7 @@
 //
 
 #include "qextserialenumerator.h"
+#include <QStringList>
 
 #ifdef  Q_CC_MINGW
 // needed for mingw to pull in appropriate dbt business...
@@ -107,13 +108,21 @@ public:
     IONotificationPortRef notificationPortRef;
 #endif // Q_OS_MAC
 
-#if defined(Q_OS_LINUX) && !defined(QESP_NO_UDEV)
+#if defined(Q_OS_LINUX)
+#if defined(QESP_NO_UDEV)
+    QObject *monitor;
+    QStringList devlist;
+    static bool deviceValidation(const QString &);
+    static QextPortInfo createPortInfo(const QString &);
+    void _q_deviceEvent(const QString &);
+#else
     QSocketNotifier *notifier;
     int notifierFd;
     struct udev *udev;
     struct udev_monitor *monitor;
 
     void _q_deviceEvent();
+#endif
 #endif
 
 private:

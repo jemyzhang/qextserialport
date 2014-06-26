@@ -40,6 +40,8 @@
 #include <linux/serial.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <QFileSystemWatcher>
+#include <QFile>
 
 void QextSerialEnumeratorPrivate::init_sys()
 {
@@ -51,6 +53,9 @@ void QextSerialEnumeratorPrivate::init_sys()
     udev = udev_new();
     if (!udev)
         qCritical() << "Unable to initialize udev notifications";
+#else
+    monitor = NULL;
+    devlist.clear();
 #endif
 }
 
@@ -67,6 +72,14 @@ void QextSerialEnumeratorPrivate::destroy_sys()
 
     if (udev)
         udev_unref(udev);
+#else
+    if(monitor)
+    {
+        QFileSystemWatcher *fw = static_cast<QFileSystemWatcher *>(monitor);
+        fw->removePath("/dev");
+        delete monitor;
+        monitor = NULL;
+    }
 #endif
 }
 
@@ -132,63 +145,15 @@ QList<QextPortInfo> QextSerialEnumeratorPrivate::getPorts_sys()
     QStringList portValidList;
 
     for (int i = 0; i < portNameList.size(); i++) {
-        // get device driver
-        QString devicedir = sysdir + "/" + portNameList.at(i) + "/device";
-        struct stat st;
-        if(lstat(devicedir.toStdString().c_str(), &st) == 0 && S_ISLNK(st.st_mode)){
-            char buffer[1024];
-            memset(buffer, 0, sizeof(buffer));
-            devicedir += "/driver";
-            if(readlink(devicedir.toStdString().c_str(), buffer, sizeof(buffer)) <= 0)
-            {
-                continue;
-            }
-            QString driver = basename(buffer);
-            if(driver.length() > 0)
-            {
-                if(driver == "serial8250")
-                {
-                    QString devfile = "/dev/" + portNameList.at(i);
-                    //try to open device
-                    int fd = open(devfile.toStdString().c_str(), O_RDWR | O_NONBLOCK | O_NOCTTY);
-                    if(fd >= 0)
-                    {
-                        //Get serial info
-                        struct serial_struct serinfo;
-                        if(ioctl(fd, TIOCGSERIAL, &serinfo) == 0){
-                            //if device type is PORT_UNKNOWN
-                            if (serinfo.type == PORT_UNKNOWN)
-                            {
-                                continue;
-                            }
-                        }
-                        close(fd);
-                    }else{
-                        continue;
-                    }
-                }
-                portValidList.append(portNameList.at(i));
-            }
+        if(deviceValidation(portNameList.at(i)))
+        {
+            portValidList.append(portNameList.at(i));
         }
     }
    portNameList = portValidList;
 
     foreach (QString str , portNameList) {
-        QextPortInfo inf;
-        inf.physName = QLatin1String("/dev/")+str;
-        inf.portName = str;
-
-        if (str.contains(QLatin1String("ttyS"))) {
-            inf.friendName = QLatin1String("Serial port ")+str.remove(0, 4);
-        }
-        else if (str.contains(QLatin1String("ttyUSB"))) {
-            inf.friendName = QLatin1String("USB-serial adapter ")+str.remove(0, 6);
-        }
-        else if (str.contains(QLatin1String("rfcomm"))) {
-            inf.friendName = QLatin1String("Bluetooth-serial adapter ")+str.remove(0, 6);
-        }
-        inf.enumName = QLatin1String("/dev"); // is there a more helpful name for this?
-        infoList.append(inf);
+        infoList.append(createPortInfo(str));
     }
 #endif
 
@@ -221,7 +186,23 @@ bool QextSerialEnumeratorPrivate::setUpNotifications_sys(bool setup)
 
     return true;
 #else
-    return false;
+    Q_Q(QextSerialEnumerator);
+    QFileSystemWatcher *fw = new QFileSystemWatcher(q);
+    QString path("/dev/");
+    fw->addPath(path);
+    q->connect(fw,SIGNAL(directoryChanged(QString)), q, SLOT(_q_deviceEvent(QString)));
+    monitor = fw;
+    devlist.clear();
+    QStringList prefixes;
+    prefixes
+            << QLatin1String("ttyS*")
+            << QLatin1String("ttyACM*")
+            << QLatin1String("ttyUSB*")
+            << QLatin1String("rfcomm*");
+
+    QDir dir(path.toLatin1());
+    devlist = dir.entryList(prefixes, (QDir::System | QDir::Dirs), QDir::Name);
+    return true;
 #endif
 }
 
@@ -241,5 +222,118 @@ void QextSerialEnumeratorPrivate::_q_deviceEvent()
 
         udev_device_unref(dev);
     }
+}
+#else
+void QextSerialEnumeratorPrivate::_q_deviceEvent(const QString &path)
+{
+    Q_Q(QextSerialEnumerator);
+    QStringList prefixes, pl;
+    prefixes
+            << QLatin1String("ttyS*")
+            << QLatin1String("ttyACM*")
+            << QLatin1String("ttyUSB*")
+            << QLatin1String("rfcomm*");
+
+    QDir dir(path.toLatin1());
+    pl = dir.entryList(prefixes, (QDir::System | QDir::Dirs), QDir::Name);
+    if(pl.size() == devlist.size())
+    {
+        //no sudden change, so no need to compare
+        return;
+    }
+    if(pl.size() > devlist.size())
+    {
+        //discover action
+        for(int i = 0; i < pl.size(); i++)
+        {
+            if(!devlist.contains(pl.at(i)))
+            {
+                if(deviceValidation(pl.at(i)))
+                {
+                    Q_EMIT q->deviceDiscovered(createPortInfo(pl.at(i)));
+                }
+            }
+        }
+    }else{
+        //remove action
+        for(int i = 0; i < devlist.size(); i++)
+        {
+            if(!pl.contains(devlist.at(i)))
+            {
+                if(deviceValidation(devlist.at(i)))
+                {
+                    Q_EMIT q->deviceRemoved(createPortInfo(devlist.at(i)));
+                }
+            }
+        }
+    }
+    devlist = pl;
+}
+
+#endif
+
+#ifdef QESP_NO_UDEV
+bool QextSerialEnumeratorPrivate::deviceValidation(const QString &devicename)
+{
+    QString devicedir = "/sys/class/tty/" + devicename + "/device";
+    struct stat st;
+    if(lstat(devicedir.toStdString().c_str(), &st) == 0 && S_ISLNK(st.st_mode)){
+        char buffer[1024];
+        memset(buffer, 0, sizeof(buffer));
+        devicedir += "/driver";
+        if(readlink(devicedir.toStdString().c_str(), buffer, sizeof(buffer)) <= 0)
+        {
+            return false;
+        }
+        QString driver = basename(buffer);
+        if(driver.length() > 0)
+        {
+            if(driver == "serial8250")
+            {
+                QString devfile = "/dev/" + devicename;
+                //try to open device
+                int fd = open(devfile.toStdString().c_str(), O_RDWR | O_NONBLOCK | O_NOCTTY);
+                if(fd >= 0)
+                {
+                    //Get serial info
+                    struct serial_struct serinfo;
+                    if(ioctl(fd, TIOCGSERIAL, &serinfo) == 0){
+                        //if device type is PORT_UNKNOWN
+                        if (serinfo.type == PORT_UNKNOWN)
+                        {
+                            close(fd);
+                            return false;
+                        }
+                    }
+                    close(fd);
+                }else{
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+
+#ifdef QESP_NO_UDEV
+QextPortInfo QextSerialEnumeratorPrivate::createPortInfo(const QString &devname)
+{
+        QextPortInfo inf;
+        QString str = devname;
+        inf.physName = QLatin1String("/dev/")+str;
+        inf.portName = str;
+
+        if (str.contains(QLatin1String("ttyS"))) {
+            inf.friendName = QLatin1String("Serial port ")+str.remove(0, 4);
+        }
+        else if (str.contains(QLatin1String("ttyUSB"))) {
+            inf.friendName = QLatin1String("USB-serial adapter ")+str.remove(0, 6);
+        }
+        else if (str.contains(QLatin1String("rfcomm"))) {
+            inf.friendName = QLatin1String("Bluetooth-serial adapter ")+str.remove(0, 6);
+        }
+        inf.enumName = QLatin1String("/dev"); // is there a more helpful name for this?
+        return inf;
 }
 #endif
